@@ -126,12 +126,9 @@ If the file specified with path doesn't exist, it will be created.
 	Function:    EditFile,
 }
 
-func NewAgent(client anthropic.Client, getUserMessage func() (string, bool), systemPrompt string) *Agent {
+func NewAgent(client anthropic.Client, getUserMessage func() (string, bool), systemPrompt string, tools []ToolDefinition) *Agent {
 	// Create a buffered channel for output events
 	outputChan := make(chan OutputEvent, 100)
-
-	// Define available tools
-	tools := []ToolDefinition{ReadFileDefinition, ListFilesDefinition, EditFileDefinition}
 
 	return &Agent{
 		client:          client,
@@ -201,15 +198,10 @@ func (a *Agent) executeTool(id, name string, input json.RawMessage) anthropic.Co
 
 func (a *Agent) Run(ctx context.Context) error {
 	var messages []anthropic.MessageParam
-	startConversation := "Start the conversation" // Create user message
-	userContent := anthropic.ContentBlockParamUnion{
-		OfText: &anthropic.TextBlockParam{Text: startConversation},
-	}
-	userMessage := anthropic.MessageParam{
-		Role:    "user",
-		Content: []anthropic.ContentBlockParamUnion{userContent},
-	}
-	messages = append(messages, userMessage)
+	
+	// Initial user message to start conversation using helper functions
+	startMessage := anthropic.NewUserMessage(anthropic.NewTextBlock("Start the conversation"))
+	messages = append(messages, startMessage)
 
 	for {
 		// We're letting Claude speak first, with streaming for responsiveness
@@ -220,34 +212,25 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 		a.outputChan <- OutputEvent{Type: EventNewline}
 
-		// Convert the message to MessageParam for appending to the messages slice
-		var messageContent []anthropic.ContentBlockParamUnion
+		// Process Claude's response and collect any tool results
 		var toolResults []anthropic.ContentBlockParamUnion
-
+		
+		// Handle message content blocks - only process tool_use blocks
+		// Text content is already output during streaming, don't output it again here
 		for _, block := range message.Content {
-			if block.Type == "text" {
-				textBlock := anthropic.TextBlockParam{Text: block.Text}
-				messageContent = append(messageContent, anthropic.ContentBlockParamUnion{OfText: &textBlock})
-			} else if block.Type == "tool_use" {
-				// Process tool calls (only for local tools, not web search)
+			if block.Type == "tool_use" {
 				result := a.executeTool(block.ID, block.Name, block.Input)
 				toolResults = append(toolResults, result)
 			}
+			// Skip outputting text content here since it was already handled in streaming
 		}
+		
+		// Add Claude's response to conversation using ToParam()
+		messages = append(messages, message.ToParam())
 
-		assistantMessage := anthropic.MessageParam{
-			Role:    "assistant",
-			Content: messageContent,
-		}
-
-		messages = append(messages, assistantMessage)
-
-		// If we have tool results, add them to the conversation
+		// If we have tool results, add them as a user message using the helper function
 		if len(toolResults) > 0 {
-			toolResultMessage := anthropic.MessageParam{
-				Role:    "user",
-				Content: toolResults,
-			}
+			toolResultMessage := anthropic.NewUserMessage(toolResults...)
 			messages = append(messages, toolResultMessage)
 			// Skip getting user input and go straight to next Claude response
 			continue
@@ -260,13 +243,8 @@ func (a *Agent) Run(ctx context.Context) error {
 			break
 		}
 
-		userContent := anthropic.ContentBlockParamUnion{
-			OfText: &anthropic.TextBlockParam{Text: userInput},
-		}
-		userMessage := anthropic.MessageParam{
-			Role:    "user",
-			Content: []anthropic.ContentBlockParamUnion{userContent},
-		}
+		// Add user's message to conversation using helper functions
+		userMessage := anthropic.NewUserMessage(anthropic.NewTextBlock(userInput))
 		messages = append(messages, userMessage)
 	}
 
@@ -274,11 +252,6 @@ func (a *Agent) Run(ctx context.Context) error {
 }
 
 func (a *Agent) runInference(ctx context.Context, messages []anthropic.MessageParam) (*anthropic.Message, error) {
-	// Create the message creation request
-	sysPrompt := []anthropic.TextBlockParam{
-		{Text: a.SystemPrompt},
-	}
-
 	// Convert tool definitions to Anthropic tool parameters
 	anthropicTools := []anthropic.ToolUnionParam{}
 
@@ -298,12 +271,17 @@ func (a *Agent) runInference(ctx context.Context, messages []anthropic.MessagePa
 		anthropicTools = append(anthropicTools, WebSearchToolDefinition)
 	}
 
+	// Create request params
 	req := anthropic.MessageNewParams{
 		Model:     "claude-sonnet-4-20250514",
 		MaxTokens: 1024,
-		System:    sysPrompt,
 		Messages:  messages,
 		Tools:     anthropicTools,
+	}
+
+	// Add system prompt if present
+	if a.SystemPrompt != "" {
+		req.System = []anthropic.TextBlockParam{{Text: a.SystemPrompt}}
 	}
 
 	// Use streaming API for better responsiveness
@@ -374,6 +352,10 @@ func (a *Agent) runInference(ctx context.Context, messages []anthropic.MessagePa
 	select {
 	case <-done:
 		// Stream completed successfully
+		// Ensure the message has content to avoid "messages.X.content: Field required" error
+		if finalMessage.Content == nil || len(finalMessage.Content) == 0 {
+			return nil, fmt.Errorf("accumulated message has no content")
+		}
 		return finalMessage, nil
 	case err := <-errCh:
 		// Error occurred during streaming
