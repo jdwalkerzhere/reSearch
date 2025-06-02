@@ -39,6 +39,26 @@ type ToolDefinition struct {
 	Function    func(input json.RawMessage) (string, error)
 }
 
+// WebSearchToolDefinition represents the web search tool
+// Note: This is handled by Anthropic's servers, so no local function needed
+var WebSearchToolDefinition = anthropic.ToolUnionParam{
+	OfWebSearchTool20250305: &anthropic.WebSearchTool20250305Param{
+		Type:    "web_search_20250305",
+		Name:    "web_search",
+		MaxUses: anthropic.Int(5), // Optional: limit searches per request
+		// Optional: Add domain filtering or location if needed
+		// AllowedDomains: []string{"example.com"},
+		// BlockedDomains: []string{"untrusted.com"},
+		// UserLocation: &anthropic.WebSearchTool20250305ParamUserLocation{
+		//     Type:     "approximate",
+		//     City:     anthropic.String("San Francisco"),
+		//     Region:   anthropic.String("California"),
+		//     Country:  anthropic.String("US"),
+		//     Timezone: anthropic.String("America/Los_Angeles"),
+		// },
+	},
+}
+
 // GenerateSchema creates a JSON schema for the given type
 func GenerateSchema[T any]() anthropic.ToolInputSchemaParam {
 	reflector := jsonschema.Reflector{
@@ -114,22 +134,29 @@ func NewAgent(client anthropic.Client, getUserMessage func() (string, bool), sys
 	tools := []ToolDefinition{ReadFileDefinition, ListFilesDefinition, EditFileDefinition}
 
 	return &Agent{
-		client:         client,
-		getUserMessage: getUserMessage,
-		SystemPrompt:   systemPrompt,
-		outputChan:     outputChan,
-		done:           make(chan struct{}),
-		tools:          tools,
+		client:          client,
+		getUserMessage:  getUserMessage,
+		SystemPrompt:    systemPrompt,
+		outputChan:      outputChan,
+		done:            make(chan struct{}),
+		tools:           tools,
+		enableWebSearch: true, // Enable web search by default
 	}
 }
 
 type Agent struct {
-	client         anthropic.Client
-	getUserMessage func() (string, bool)
-	SystemPrompt   string `json:"system,omitzero"`
-	outputChan     chan OutputEvent
-	done           chan struct{}
-	tools          []ToolDefinition
+	client          anthropic.Client
+	getUserMessage  func() (string, bool)
+	SystemPrompt    string `json:"system,omitzero"`
+	outputChan      chan OutputEvent
+	done            chan struct{}
+	tools           []ToolDefinition
+	enableWebSearch bool
+}
+
+// SetWebSearchEnabled allows enabling/disabling web search
+func (a *Agent) SetWebSearchEnabled(enabled bool) {
+	a.enableWebSearch = enabled
 }
 
 // OutputChannel returns the channel that emits output events
@@ -145,6 +172,12 @@ func (a *Agent) Close() {
 
 // executeTool executes the specified tool with the given input
 func (a *Agent) executeTool(id, name string, input json.RawMessage) anthropic.ContentBlockParamUnion {
+	// Web search is handled by Anthropic's servers, not locally
+	if name == "web_search" {
+		// This shouldn't happen as web search is server-side, but handle gracefully
+		return anthropic.NewToolResultBlock(id, "Web search is handled server-side", true)
+	}
+
 	var toolDef ToolDefinition
 	var found bool
 	for _, tool := range a.tools {
@@ -196,7 +229,7 @@ func (a *Agent) Run(ctx context.Context) error {
 				textBlock := anthropic.TextBlockParam{Text: block.Text}
 				messageContent = append(messageContent, anthropic.ContentBlockParamUnion{OfText: &textBlock})
 			} else if block.Type == "tool_use" {
-				// Process tool calls
+				// Process tool calls (only for local tools, not web search)
 				result := a.executeTool(block.ID, block.Name, block.Input)
 				toolResults = append(toolResults, result)
 			}
@@ -239,6 +272,7 @@ func (a *Agent) Run(ctx context.Context) error {
 
 	return nil
 }
+
 func (a *Agent) runInference(ctx context.Context, messages []anthropic.MessageParam) (*anthropic.Message, error) {
 	// Create the message creation request
 	sysPrompt := []anthropic.TextBlockParam{
@@ -247,6 +281,8 @@ func (a *Agent) runInference(ctx context.Context, messages []anthropic.MessagePa
 
 	// Convert tool definitions to Anthropic tool parameters
 	anthropicTools := []anthropic.ToolUnionParam{}
+
+	// Add local tools
 	for _, tool := range a.tools {
 		anthropicTools = append(anthropicTools, anthropic.ToolUnionParam{
 			OfTool: &anthropic.ToolParam{
@@ -255,6 +291,11 @@ func (a *Agent) runInference(ctx context.Context, messages []anthropic.MessagePa
 				InputSchema: tool.InputSchema,
 			},
 		})
+	}
+
+	// Add web search tool if enabled
+	if a.enableWebSearch {
+		anthropicTools = append(anthropicTools, WebSearchToolDefinition)
 	}
 
 	req := anthropic.MessageNewParams{
@@ -300,6 +341,11 @@ func (a *Agent) runInference(ctx context.Context, messages []anthropic.MessagePa
 				switch deltaVariant := eventVariant.Delta.AsAny().(type) {
 				case anthropic.TextDelta:
 					a.outputChan <- OutputEvent{Type: EventContent, Content: deltaVariant.Text}
+				}
+			case anthropic.ContentBlockStartEvent:
+				// Handle web search events
+				if eventVariant.ContentBlock.Type == "server_tool_use" {
+					a.outputChan <- OutputEvent{Type: EventContent, Content: fmt.Sprintf("\n[Searching the web...]\n")}
 				}
 			}
 
